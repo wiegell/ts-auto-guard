@@ -13,6 +13,8 @@ import {
   TypeAliasDeclaration,
 } from 'ts-morph'
 
+Error.stackTraceLimit = Infinity
+
 const GENERATED_WARNING = 'WARNING: Do not manually change this file.'
 
 // -- Helpers --
@@ -57,7 +59,11 @@ function typeToDependency(type: Type, addDependency: IAddDependency): void {
     reportError(`${name} is not exported from ${sourceFile.getFilePath()}`)
   }
 
-  addDependency(sourceFile, name, isDefault)
+  addDependency(
+    { sourceFile, sourceIsFromNodeModulesFolder: undefined },
+    name,
+    isDefault
+  )
 }
 
 function outFilePath(sourcePath: string, guardFileName: string) {
@@ -522,7 +528,7 @@ function reusedCondition(
   const record = records.find(x => x.typeDeclaration.getType() === type)
   if (record) {
     if (record.outFile !== outFile) {
-      addDependency(record.outFile, undefined, record.guardName, false)
+      addDependency(record.outFile, record.guardName, false)
     }
     return `${record.guardName}(${varName}) as boolean`
   }
@@ -903,36 +909,38 @@ interface IImportWrap {
   imports: IImports
 }
 
-type Dependencies = Map<SourceFile, IImportWrap>
+type Dependencies = Map<ISourceFileOrModuleSpecifier, IImportWrap>
 type IAddDependency = (
-  sourceFileWrapped: ISourceWrapped,
+  sourceFileWrapped: ISourceFileOrModuleSpecifier,
   exportName: string,
   isDefault: boolean
 ) => void
 
 function createAddDependency(dependencies: Dependencies): IAddDependency {
   return function addDependency(
-    sourceFileWrapped: ISourceWrapped,
+    sourceFileOrModuleSpecifier: ISourceFileOrModuleSpecifier,
     name,
     isDefault
   ) {
+    console.log('ADD DEP  --------', name)
     const alias = name
     if (isDefault) {
       name = 'default'
     }
-    let importsWrapped = dependencies.get(sourceFileWrapped.sourceFile)
+    let importsWrapped = dependencies.get(sourceFileOrModuleSpecifier)
     if (importsWrapped === undefined) {
       importsWrapped = {
-        isFromNodeModules: sourceFileWrapped.sourceIsFromNodeModulesFolder,
+        isFromNodeModules:
+          sourceFileOrModuleSpecifier.sourceIsFromNodeModulesFolder,
         imports: {},
       }
-      dependencies.set(sourceFileWrapped.sourceFile, importsWrapped)
+      dependencies.set(sourceFileOrModuleSpecifier.sourceFile, importsWrapped)
     }
 
     const previousAlias = importsWrapped.imports[name]
     if (previousAlias !== undefined && previousAlias !== alias) {
       reportError(
-        `Conflicting export alias for "${sourceFileWrapped.sourceFile.getFilePath()}": "${alias}" vs "${previousAlias}"`
+        `Conflicting export alias for "${sourceFileOrModuleSpecifier.sourceFile.getFilePath()}": "${alias}" vs "${previousAlias}"`
       )
     }
 
@@ -992,10 +1000,7 @@ interface IRecord {
   outFile: SourceFile
 }
 
-interface ISourceWrapped {
-  sourceFile: SourceFile
-  sourceIsFromNodeModulesFolder: false | string
-}
+type ISourceFileOrModuleSpecifier = SourceFile | string
 
 export function processProject(
   project: Project,
@@ -1012,44 +1017,52 @@ export function processProject(
 
   const sourceFiles = project.getSourceFiles()
   // Sort source files by dependencies - dependencies before dependants
-  const orderedSourceFilesWrapped: ISourceWrapped[] = []
+  const orderedSourceFilesWrapped: ISourceFileOrModuleSpecifier[] = []
   const orderSourceFileByDependencies = (
-    sourceFile: SourceFile,
-    sourceIsFromNodeModulesFolder: false | string,
-    visitedFiles: SourceFile[] = []
+    sourceFileOrStringIdentifier: SourceFile | string,
+    visitedFiles: ISourceFileOrModuleSpecifier[] = []
   ) => {
     // Ignore if already added as a dependency of another, or if we hit a cyclical import
     if (
-      orderedSourceFilesWrapped.map(sf => sf.sourceFile).includes(sourceFile) ||
-      visitedFiles.includes(sourceFile)
+      orderedSourceFilesWrapped
+        .filter(sf => sf instanceof SourceFile)
+        .includes(sourceFileOrStringIdentifier) ||
+      orderedSourceFilesWrapped
+        .filter(sf => typeof sf === 'string' || sf instanceof String)
+        .includes(sourceFileOrStringIdentifier) ||
+      visitedFiles.includes(sourceFileOrStringIdentifier)
     ) {
       return
     }
-    const childVisitedFiles = [...visitedFiles, sourceFile]
+    const childVisitedFiles = [...visitedFiles, sourceFileOrStringIdentifier]
     // Add all dependencies to the ordered list first (if they have beeen specified and have not already been added)
-    sourceFile.getImportDeclarations().forEach(importDeclaration => {
-      const importSourceFile = importDeclaration.getModuleSpecifierSourceFile()
-      if (
-        importSourceFile &&
-        sourceFiles.includes(importSourceFile) &&
-        !orderedSourceFilesWrapped
-          .map(sf => sf.sourceFile)
-          .includes(importSourceFile)
-      ) {
-        orderSourceFileByDependencies(
-          importSourceFile,
-          importSourceFile.isInNodeModules()
-            ? importDeclaration.getModuleSpecifierValue()
-            : false,
-          childVisitedFiles
-        )
-      }
-    })
+    if (sourceFileOrStringIdentifier instanceof SourceFile) {
+      sourceFileOrStringIdentifier
+        .getImportDeclarations()
+        .forEach(importDeclaration => {
+          const importSourceFile = importDeclaration.getModuleSpecifierSourceFile()
+          if (
+            importSourceFile &&
+            sourceFiles.includes(importSourceFile) &&
+            !orderedSourceFilesWrapped.includes(importSourceFile) &&
+            !importSourceFile?.isInNodeModules()
+          ) {
+            orderSourceFileByDependencies(importSourceFile, childVisitedFiles)
+          } else if (
+            importSourceFile === undefined ||
+            importSourceFile.isInNodeModules()
+          ) {
+            // This will trigger on at least some imports
+            // from node_modules
+            orderSourceFileByDependencies(
+              importSourceFile || importDeclaration.getModuleSpecifierValue(),
+              childVisitedFiles
+            )
+          }
+        })
+    }
     // Add this one to the ordered list
-    orderedSourceFilesWrapped.push({
-      sourceFile,
-      sourceIsFromNodeModulesFolder,
-    })
+    orderedSourceFilesWrapped.push(sourceFileOrStringIdentifier)
   }
 
   // Top level source files kicks off the recursive order function
@@ -1129,14 +1142,21 @@ export function processProject(
             if (outFile === importFile) {
               return structures
             }
+            console.log('REDUCE ---- is from node: ', importsWrapped)
             const moduleSpecifier =
               importsWrapped.isFromNodeModules ||
               outFile.getRelativePathAsModuleSpecifierTo(importFile)
             const defaultImport = importsWrapped.imports.default
             delete importsWrapped.imports.default
-            const namedImports = Object.entries(importsWrapped).map(
-              ([alias, name]) => (alias === name ? name : { name, alias })
-            )
+            const namedImports = Object.entries(
+              importsWrapped.imports
+            ).map(([alias, name]) => (alias === name ? name : { name, alias }))
+            console.log('PUSH: ', {
+              defaultImport,
+              kind: StructureKind.ImportDeclaration,
+              moduleSpecifier,
+              namedImports,
+            })
             structures.push({
               defaultImport,
               kind: StructureKind.ImportDeclaration,
@@ -1169,21 +1189,24 @@ export function processProject(
             .replace(/\.(ts|tsx|d\.ts)$/, '')
         const importStatement = `import * as ${options.importGuards} from "${relativeOutPath}";`
         const exportStatement = `export { ${options.importGuards} };`
-        const { hasImport, hasExport, statements } =
-          sourceFileWrapped.sourceFile.getStatements().reduce(
-            (reduced, node) => {
-              const nodeText = node.getText().replace(/\s{2,}/g, ' ')
-              reduced.hasImport ||= nodeText.includes(
-                `import * as ${options.importGuards}`
-              )
-              reduced.hasExport ||= nodeText.includes(
-                `export { ${options.importGuards} }`
-              )
-              reduced.statements += 1
-              return reduced
-            },
-            { hasImport: false, hasExport: false, statements: 0 }
-          )
+        const {
+          hasImport,
+          hasExport,
+          statements,
+        } = sourceFileWrapped.sourceFile.getStatements().reduce(
+          (reduced, node) => {
+            const nodeText = node.getText().replace(/\s{2,}/g, ' ')
+            reduced.hasImport ||= nodeText.includes(
+              `import * as ${options.importGuards}`
+            )
+            reduced.hasExport ||= nodeText.includes(
+              `export { ${options.importGuards} }`
+            )
+            reduced.statements += 1
+            return reduced
+          },
+          { hasImport: false, hasExport: false, statements: 0 }
+        )
         if (!hasImport) {
           sourceFileWrapped.sourceFile.insertStatements(0, importStatement)
         }
